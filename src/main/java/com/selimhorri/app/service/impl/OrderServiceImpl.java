@@ -15,9 +15,12 @@ import com.selimhorri.app.exception.custom.InvalidInputException;
 import com.selimhorri.app.exception.custom.InvalidOrderStatusException;
 import com.selimhorri.app.exception.custom.ResourceNotFoundException;
 import com.selimhorri.app.helper.OrderMappingHelper;
+import com.selimhorri.app.metrics.OrderBusinessMetrics;
 import com.selimhorri.app.repository.CartRepository;
 import com.selimhorri.app.repository.OrderRepository;
 import com.selimhorri.app.service.OrderService;
+
+import io.micrometer.core.instrument.Timer;
 
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
@@ -30,6 +33,7 @@ public class OrderServiceImpl implements OrderService {
 
     private final OrderRepository orderRepository;
     private final CartRepository cartRepository;
+    private final OrderBusinessMetrics businessMetrics;
 
     @Override
     public List<OrderDto> findAll() {
@@ -53,20 +57,34 @@ public class OrderServiceImpl implements OrderService {
     public OrderDto save(final OrderDto orderDto) {
         log.info("Creating new order");
         
-        orderDto.setOrderId(null);
-        orderDto.setOrderStatus(null);
+        Timer.Sample timer = businessMetrics.startOrderProcessingTimer();
+        
+        try {
+            orderDto.setOrderId(null);
+            orderDto.setOrderStatus(null);
 
-        if (orderDto.getCartDto() == null || orderDto.getCartDto().getCartId() == null) {
-            throw new InvalidInputException(ErrorCode.MISSING_REQUIRED_FIELD, 
-                    "Order must be associated with a cart");
+            if (orderDto.getCartDto() == null || orderDto.getCartDto().getCartId() == null) {
+                throw new InvalidInputException(ErrorCode.MISSING_REQUIRED_FIELD, 
+                        "Order must be associated with a cart");
+            }
+
+            cartRepository.findById(orderDto.getCartDto().getCartId())
+                    .orElseThrow(() -> new ResourceNotFoundException(ErrorCode.CART_NOT_FOUND, 
+                            orderDto.getCartDto().getCartId()));
+
+            OrderDto savedOrder = OrderMappingHelper.map(
+                    this.orderRepository.save(OrderMappingHelper.mapForCreationOrder(orderDto)));
+            
+            // Registrar métricas de negocio
+            businessMetrics.recordOrderCreated(
+                    savedOrder.getOrderStatus() != null ? savedOrder.getOrderStatus() : OrderStatus.CREATED,
+                    savedOrder.getOrderFee()
+            );
+            
+            return savedOrder;
+        } finally {
+            businessMetrics.stopOrderProcessingTimer(timer);
         }
-
-        cartRepository.findById(orderDto.getCartDto().getCartId())
-                .orElseThrow(() -> new ResourceNotFoundException(ErrorCode.CART_NOT_FOUND, 
-                        orderDto.getCartDto().getCartId()));
-
-        return OrderMappingHelper.map(
-                this.orderRepository.save(OrderMappingHelper.mapForCreationOrder(orderDto)));
     }
 
     @Override
@@ -92,10 +110,14 @@ public class OrderServiceImpl implements OrderService {
                         "Unknown order status: " + existingOrder.getStatus());
         }
 
+        OrderStatus oldStatus = existingOrder.getStatus();
         existingOrder.setStatus(newStatus);
         Order updatedOrder = this.orderRepository.save(existingOrder);
 
-        log.info("Order status updated successfully from {} to {}", existingOrder.getStatus(), newStatus);
+        log.info("Order status updated successfully from {} to {}", oldStatus, newStatus);
+        
+        // Registrar métricas de negocio
+        businessMetrics.recordOrderStatusChange(oldStatus, newStatus);
 
         return OrderMappingHelper.map(updatedOrder);
     }
